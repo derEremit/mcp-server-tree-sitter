@@ -1,15 +1,16 @@
 """Code analysis tools using tree-sitter."""
 
-import json as _json
+import json
 import os
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-try:  # Python 3.11+
-    import tomllib as _tomllib
-except ImportError:  # Python 3.10
-    import tomli as _tomllib  # type: ignore[no-redef]
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # Python 3.10
+    import tomli as tomllib
 
 from ..exceptions import SecurityError
 from ..language.query_templates import get_query_template
@@ -426,17 +427,18 @@ def process_symbol_matches(
 def _read_toml(path: Path) -> Dict[str, Any]:
     try:
         with open(path, "rb") as f:
-            return _tomllib.load(f)
-    except (OSError, _tomllib.TOMLDecodeError):
+            data = tomllib.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, tomllib.TOMLDecodeError):
         return {}
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
     try:
         with open(path, encoding="utf-8") as f:
-            data = _json.load(f)
+            data = json.load(f)
         return data if isinstance(data, dict) else {}
-    except (OSError, _json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError):
         return {}
 
 
@@ -445,11 +447,17 @@ def _resolve_python_target(root: Path, target: str) -> Optional[str]:
 
     Tries ``<root>/<parts>.py`` and ``<root>/<parts>/__init__.py``,
     plus the same under ``src/``.
+
+    A hostile manifest could supply a target whose module parts are empty,
+    relative (``.`` / ``..``) or contain path separators; such targets are
+    rejected outright so resolution can never escape ``root``.
     """
     module = target.split(":", 1)[0].strip()
     if not module:
         return None
     parts = module.split(".")
+    if any((not p) or p in (".", "..") or "/" in p or "\\" in p for p in parts):
+        return None
     for prefix in ((), ("src",)):
         base = root.joinpath(*prefix, *parts)
         for candidate in (base.with_suffix(".py"), base / "__init__.py"):
@@ -458,9 +466,39 @@ def _resolve_python_target(root: Path, target: str) -> Optional[str]:
     return None
 
 
-def _detect_manifest_entry_points(
-    root: Path, languages: Dict[str, int]
-) -> List[Dict[str, str]]:
+def _cargo_bin_entry(root: Path, b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Resolve a single Cargo ``[[bin]]`` / ``[bin]`` table to an entry-point dict.
+
+    Honors an explicit ``path`` then falls back to the ``src/bin/<name>.rs`` and
+    ``src/bin/<name>/main.rs`` conventions. A candidate that resolves outside
+    ``root`` (e.g. an absolute or ``..``-escaping ``path``) is skipped rather
+    than raising.
+    """
+    name = b.get("name")
+    if not isinstance(name, str):
+        return None
+    candidates: List[str] = []
+    explicit_path = b.get("path")
+    if isinstance(explicit_path, str):
+        candidates.append(explicit_path)
+    candidates.extend([f"src/bin/{name}.rs", f"src/bin/{name}/main.rs"])
+    for cand in candidates:
+        resolved = (root / cand).resolve()
+        try:
+            rel_path = resolved.relative_to(root.resolve())
+        except ValueError:
+            continue
+        if (root / rel_path).is_file():
+            return {
+                "path": str(rel_path),
+                "language": "rust",
+                "name": name,
+                "source": "Cargo.toml",
+            }
+    return None
+
+
+def _detect_manifest_entry_points(root: Path, languages: Dict[str, int]) -> List[Dict[str, Any]]:
     """Detect entry points declared in package manifests.
 
     Augments filename-based heuristics with explicit declarations:
@@ -468,13 +506,14 @@ def _detect_manifest_entry_points(
     - Python: ``pyproject.toml`` ``[project.scripts]`` / ``[project.gui-scripts]``
       (PEP 621) and ``[tool.poetry.scripts]``.
     - Node:   ``package.json`` ``"bin"`` (string or object) and ``"main"``.
-    - Rust:   ``Cargo.toml`` ``[[bin]]``.
+    - Rust:   ``Cargo.toml`` ``[[bin]]`` and the singular ``[bin]`` table.
 
     Returned entries include ``path`` and ``language`` (matching the existing
-    schema) plus ``name`` (declared script/binary name) and ``source``
-    (manifest file the entry was read from).
+    schema) plus ``name`` (declared script/binary name, or ``None`` when a
+    ``package.json`` declares no ``name``) and ``source`` (manifest file the
+    entry was read from).
     """
-    found: List[Dict[str, str]] = []
+    found: List[Dict[str, Any]] = []
 
     if "python" in languages:
         pyproject = root / "pyproject.toml"
@@ -520,21 +559,23 @@ def _detect_manifest_entry_points(
         pkg_json = root / "package.json"
         if pkg_json.is_file():
             data = _read_json(pkg_json)
-            entries: Dict[str, str] = {}
+            raw_name = data.get("name")
+            pkg_name: Optional[str] = raw_name if isinstance(raw_name, str) else None
+            # (declared name | None, target) pairs — name stays None rather than
+            # being fabricated when package.json omits "name".
+            entries: List[Tuple[Optional[str], str]] = []
             bin_field = data.get("bin")
             if isinstance(bin_field, str):
-                pkg_name = data.get("name") if isinstance(data.get("name"), str) else "default"
-                entries[pkg_name] = bin_field  # type: ignore[index]
+                entries.append((pkg_name, bin_field))
             elif isinstance(bin_field, dict):
                 for k, v in bin_field.items():
                     if isinstance(k, str) and isinstance(v, str):
-                        entries[k] = v
+                        entries.append((k, v))
             main_field = data.get("main")
             if not entries and isinstance(main_field, str):
-                pkg_name = data.get("name") if isinstance(data.get("name"), str) else "main"
-                entries[pkg_name] = main_field  # type: ignore[index]
-            for script_name, target in entries.items():
-                rel = (root / target).resolve()
+                entries.append((pkg_name, main_field))
+            for js_name, js_target in entries:
+                rel = (root / js_target).resolve()
                 try:
                     rel_path = rel.relative_to(root.resolve())
                 except ValueError:
@@ -546,7 +587,7 @@ def _detect_manifest_entry_points(
                         {
                             "path": rel_str,
                             "language": lang,
-                            "name": script_name,
+                            "name": js_name,
                             "source": "package.json",
                         }
                     )
@@ -556,30 +597,13 @@ def _detect_manifest_entry_points(
         if cargo.is_file():
             data = _read_toml(cargo)
             bins = data.get("bin")
-            if isinstance(bins, list):
-                for b in bins:
-                    if not isinstance(b, dict):
-                        continue
-                    name = b.get("name")
-                    if not isinstance(name, str):
-                        continue
-                    candidates: List[str] = []
-                    explicit_path = b.get("path")
-                    if isinstance(explicit_path, str):
-                        candidates.append(explicit_path)
-                    candidates.extend([f"src/bin/{name}.rs", f"src/bin/{name}/main.rs"])
-                    for cand in candidates:
-                        target = root / cand
-                        if target.is_file():
-                            found.append(
-                                {
-                                    "path": str(target.relative_to(root)),
-                                    "language": "rust",
-                                    "name": name,
-                                    "source": "Cargo.toml",
-                                }
-                            )
-                            break
+            # [[bin]] parses as a list of tables; the singular [bin] as one table.
+            bin_tables: List[Any] = bins if isinstance(bins, list) else [bins] if isinstance(bins, dict) else []
+            for b in bin_tables:
+                if isinstance(b, dict):
+                    entry = _cargo_bin_entry(root, b)
+                    if entry is not None:
+                        found.append(entry)
 
     return found
 
@@ -597,7 +621,13 @@ def analyze_project_structure(
         mcp_ctx: Optional MCP context for progress reporting
 
     Returns:
-        Project structure analysis
+        Project structure analysis. The ``entry_points`` list has a
+        heterogeneous schema: every entry carries ``path`` and ``language``;
+        entries discovered from package manifests (pyproject.toml,
+        package.json, Cargo.toml) additionally carry ``name`` (the declared
+        script/binary name, or ``None`` when a package.json omits ``"name"``)
+        and ``source`` (the manifest file the entry was read from). Entries
+        from the filename-pattern heuristic carry only ``path``/``language``.
     """
     root = project.root_path
 
@@ -613,7 +643,7 @@ def analyze_project_structure(
     languages = project.languages
 
     # Find potential entry points based on common patterns
-    entry_points = []
+    entry_points: List[Dict[str, Any]] = []
     entry_patterns = {
         "python": ["__main__.py", "main.py", "app.py", "run.py", "manage.py"],
         "javascript": ["index.js", "app.js", "main.js", "server.js"],
