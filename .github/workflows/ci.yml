@@ -27,19 +27,24 @@ jobs:
         curl -LsSf https://astral.sh/uv/install.sh | sh
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-    - name: Install dependencies with uv
+    # Both install paths use uv.lock as the source of truth so CI sees the
+    # same resolved versions as local dev. Without this, every CI run is a
+    # fresh resolve against pyproject.toml's lower bounds and silently picks
+    # up upstream API breaks (e.g. tree-sitter 0.25 changing parse() to
+    # require str instead of bytes).
+    - name: Install dependencies with uv (locked)
       if: matrix.install-method == 'uv'
       run: |
-        uv venv
+        uv sync --frozen --extra dev
         source .venv/bin/activate
-        uv pip install -e ".[dev]"
         which ruff
         which python
 
-    - name: Install globally with uvx (system-wide)
+    - name: Install globally with pip (locked via exported constraints)
       if: matrix.install-method == 'uvx'
       run: |
-        python -m pip install -e ".[dev]"
+        uv export --frozen --extra dev --no-hashes -o /tmp/ci-requirements.txt
+        python -m pip install -r /tmp/ci-requirements.txt
         which ruff
         which python
 

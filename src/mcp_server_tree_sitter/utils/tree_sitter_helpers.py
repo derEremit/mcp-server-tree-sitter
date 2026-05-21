@@ -41,10 +41,12 @@ def create_query(language: Any, query_string: str) -> Any:
 
 def query_captures(query: Any, node: Any) -> Any:
     """Compat wrapper: works with both old (query.captures) and new (QueryCursor) API."""
-    # New API (py-tree-sitter >= 0.24): Query has no .captures(), use QueryCursor
+    # New API (py-tree-sitter >= 0.24): Query has no .captures(), use QueryCursor.
+    # The import is guarded for older tree-sitter versions that lack QueryCursor;
+    # mypy can't see the runtime version branching, so silence attr-defined here.
     if not hasattr(query, "captures"):
         try:
-            from tree_sitter import QueryCursor
+            from tree_sitter import QueryCursor  # type: ignore[attr-defined]
 
             cursor = QueryCursor(query)
             return cursor.captures(node)

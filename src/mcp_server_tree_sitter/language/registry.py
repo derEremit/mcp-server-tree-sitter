@@ -212,9 +212,10 @@ class LanguageRegistry:
         try:
             # Try to get a parser directly from the language pack
             # Type ignore: language_name is dynamic but tree-sitter-language-pack
-            # types expect a Literal with specific language names
-            parser = get_parser(language_name)  # type: ignore
-            return parser
+            # types expect a Literal with specific language names; the package's
+            # return type is also a private subtype, not the public tree_sitter.Parser.
+            parser = get_parser(language_name)  # type: ignore[arg-type]
+            return parser  # type: ignore[return-value]
         except Exception:
             # Fall back to older method, importing at runtime to avoid circular imports
             from ..cache.parser_cache import get_cached_parser
